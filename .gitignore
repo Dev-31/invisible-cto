@@ -1,0 +1,27 @@
+# Environment and secrets
+.env
+*.env
+.env.*
+secrets/
+credentials/
+
+# Logs (keep dir, ignore files)
+logs/*.log
+logs/*.json
+
+# Python
+__pycache__/
+*.pyc
+venv/
+.venv/
+
+# Node
+node_modules/
+*.tmp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Git
+*.gitkeep
