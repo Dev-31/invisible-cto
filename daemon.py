@@ -6,16 +6,22 @@ import time
 import json
 import os
 import logging
-from typing import Optional
+import hashlib
+from typing import Optional, Dict, List
 from openai import OpenAI
 
-# Configure basic logging
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+# Structured Logging
 logger = logging.getLogger("invisible-cto")
+logger.setLevel(logging.INFO)
+handler = logging.StreamHandler(sys.stdout)
+handler.setFormatter(logging.Formatter('{"timestamp": "%(asctime)s", "level": "%(levelname)s", "message": %(message)s}'))
+logger.addHandler(handler)
 
 # Constants
 LOG_BUFFER_SIZE = 30
 COOLDOWN_SECONDS = int(os.environ.get("COOLDOWN_SECONDS", 60))
+LOCK_FILE = "/tmp/invisible_cto.lock"
+CACHE_FILE = "/tmp/invisible_cto_cache.json"
 DEFAULT_DEPLOY_CMD = os.environ.get("DEPLOY_CMD", "railway up").split()
 DEFAULT_LOG_CMD = os.environ.get("LOG_CMD", "railway logs --tail").split()
 
@@ -38,178 +44,153 @@ You MUST return ONLY a valid JSON object with the following exact structure, no 
 If you cannot determine the file or fix, return an empty JSON object: {}
 """
 
-def get_openai_client() -> OpenAI:
-    """Initialize the OpenAI client using environment variables."""
-    api_key = os.environ.get("OPENAI_API_KEY")
-    base_url = os.environ.get("OPENAI_BASE_URL")
-    if not api_key:
-        logger.warning("OPENAI_API_KEY is not set. Assuming default/configured auth or mocked proxy.")
-    
-    return OpenAI(api_key=api_key, base_url=base_url)
-
-def call_llm_for_fix(client: OpenAI, log_buffer: str) -> Optional[dict]:
-    """Call the LLM to get a JSON patch based on the log buffer."""
-    logger.info("Calling LLM to analyze the error and generate a fix...")
-    prompt = f"Here is the recent log output containing the error:\n\n{log_buffer}\n\nPlease provide the JSON patch."
-    
-    try:
-        response = client.chat.completions.create(
-            model=os.environ.get("OPENAI_MODEL", "gpt-4o"),
-            messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": prompt}
-            ],
-            temperature=0.2
-        )
-        
-        content = response.choices[0].message.content.strip()
-        
-        # Strip potential markdown block syntax if the LLM ignores instructions
-        if content.startswith("```json"):
-            content = content[7:]
-        if content.startswith("```"):
-            content = content[3:]
-        if content.endswith("```"):
-            content = content[:-3]
-        
-        content = content.strip()
-        
-        if not content or content == "{}":
-            logger.info("LLM returned an empty patch. No fix applied.")
-            return None
-            
-        patch = json.loads(content)
-        
-        if all(k in patch for k in ("file_path", "old_code", "new_code")):
-            return patch
-        else:
-            logger.error(f"LLM returned invalid patch structure: {patch}")
-            return None
-            
-    except Exception as e:
-        logger.error(f"Error calling LLM: {e}")
-        return None
-
-def apply_patch(patch: dict) -> bool:
-    """Apply the JSON patch to the local file system."""
-    file_path = patch.get("file_path")
-    old_code = patch.get("old_code")
-    new_code = patch.get("new_code")
-    
-    # Simple sanitization — reject absolute paths (Unix and Windows) and traversal
-    import re as _re
-    is_absolute = (
-        file_path.startswith("/")
-        or file_path.startswith("\\")
-        or _re.match(r'^[A-Za-z]:[/\\]', file_path)
-    )
-    if is_absolute or ".." in file_path:
-        logger.error(f"Unsafe file path provided by LLM: {file_path}")
-        return False
-        
-    if not os.path.exists(file_path):
-        logger.error(f"File not found: {file_path}")
-        return False
-        
-    try:
-        with open(file_path, "r", encoding="utf-8") as f:
-            content = f.read()
-            
-        if old_code not in content:
-            logger.error("old_code exact match not found in the file. Patch aborted.")
+class StateManager:
+    @staticmethod
+    def acquire_lock():
+        if os.path.exists(LOCK_FILE):
             return False
-            
-        new_content = content.replace(old_code, new_code, 1)
-        
-        with open(file_path, "w", encoding="utf-8") as f:
-            f.write(new_content)
-            
-        logger.info(f"Successfully patched {file_path}")
+        with open(LOCK_FILE, "w") as f:
+            f.write(str(os.getpid()))
         return True
-    except Exception as e:
-        logger.error(f"Failed to apply patch: {e}")
-        return False
 
-def deploy_fix():
-    """Deploy the application after fixing."""
-    logger.info(f"Deploying fix using command: {' '.join(DEFAULT_DEPLOY_CMD)}")
-    try:
-        # Run deploy synchronously
-        result = subprocess.run(DEFAULT_DEPLOY_CMD, capture_output=True, text=True, check=True)
-        logger.info("Deployment successful.")
-        logger.debug(result.stdout)
-    except subprocess.CalledProcessError as e:
-        logger.error(f"Deployment failed with exit code {e.returncode}")
-        logger.error(f"Deploy error output: {e.stderr}")
-    except FileNotFoundError:
-        logger.error(f"Deploy command not found: {DEFAULT_DEPLOY_CMD[0]}")
+    @staticmethod
+    def release_lock():
+        if os.path.exists(LOCK_FILE):
+            os.remove(LOCK_FILE)
 
-def run_daemon():
-    """Main daemon loop to tail logs and auto-heal."""
-    logger.info("Starting Invisible CTO daemon...")
-    client = get_openai_client()
-    log_buffer = collections.deque(maxlen=LOG_BUFFER_SIZE)
-    last_fix_time = 0
-    
-    logger.info(f"Tailing logs via command: {' '.join(DEFAULT_LOG_CMD)}")
-    
-    try:
-        process = subprocess.Popen(
-            DEFAULT_LOG_CMD,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            bufsize=1
-        )
-    except FileNotFoundError:
-        logger.error(f"Log command not found: {DEFAULT_LOG_CMD[0]}. Ensure railway CLI is installed.")
-        sys.exit(1)
+    @staticmethod
+    def get_cache():
+        if os.path.exists(CACHE_FILE):
+            with open(CACHE_FILE, "r") as f:
+                return json.load(f)
+        return {}
 
-    try:
-        for line in iter(process.stdout.readline, ""):
-            if not line:
-                continue
-                
-            line = line.rstrip('\n')
-            log_buffer.append(line)
-            # Only print debug trace of logs if needed
-            # logger.debug(f"LOG: {line}")
+    @staticmethod
+    def save_cache(cache):
+        with open(CACHE_FILE, "w") as f:
+            json.dump(cache, f)
+
+class Worker:
+    def __init__(self, client: OpenAI):
+        self.client = client
+        self.history = collections.deque(maxlen=5) # Loop detection
+
+    def analyze_and_patch(self, log_context: str) -> Optional[dict]:
+        # Loop detection: hash the context
+        context_hash = hashlib.sha256(log_context.encode()).hexdigest()
+        if context_hash in self.history:
+            logger.warning(json.dumps({"event": "loop_detected", "hash": context_hash}))
+            return None
+        self.history.append(context_hash)
+
+        # Semantic caching check
+        cache = StateManager.get_cache()
+        if context_hash in cache:
+            logger.info(json.dumps({"event": "cache_hit", "hash": context_hash}))
+            return cache[context_hash]
+
+        logger.info(json.dumps({"event": "llm_call_initiated"}))
+        try:
+            response = self.client.chat.completions.create(
+                model=os.environ.get("OPENAI_MODEL", "gpt-4o"),
+                messages=[
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": f"Here is the recent log output containing the error:\n\n{log_context}\n\nPlease provide the JSON patch."}
+                ],
+                temperature=0.2
+            )
+            content = response.choices[0].message.content.strip()
+            # Clean Markdown
+            content = re.sub(r"^```json\s*", "", content)
+            content = re.sub(r"\s*```$", "", content)
             
-            if ERROR_REGEX.search(line):
-                current_time = time.time()
+            patch = json.loads(content)
+            
+            # Cache the result
+            cache[context_hash] = patch
+            StateManager.save_cache(cache)
+            
+            return patch if patch else None
+        except Exception as e:
+            logger.error(json.dumps({"event": "error", "message": str(e)}))
+            return None
+
+class Orchestrator:
+    def __init__(self):
+        self.client = self._get_openai_client()
+        self.worker = Worker(self.client)
+        self.log_buffer = collections.deque(maxlen=LOG_BUFFER_SIZE)
+        self.last_fix_time = 0
+
+    def _get_openai_client(self) -> OpenAI:
+        api_key = os.environ.get("OPENAI_API_KEY")
+        base_url = os.environ.get("OPENAI_BASE_URL")
+        return OpenAI(api_key=api_key, base_url=base_url)
+
+    def run(self):
+        logger.info(json.dumps({"event": "daemon_started"}))
+        try:
+            process = subprocess.Popen(
+                DEFAULT_LOG_CMD,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1
+            )
+        except Exception as e:
+            logger.error(json.dumps({"event": "critical_failure", "message": f"Could not start log process: {e}"}))
+            sys.exit(1)
+
+        try:
+            for line in iter(process.stdout.readline, ""):
+                line = line.rstrip('\n')
+                self.log_buffer.append(line)
                 
-                # Check cooldown
-                if current_time - last_fix_time < COOLDOWN_SECONDS:
-                    logger.warning("Error matched, but currently in cooldown period. Ignoring.")
-                    continue
-                    
-                logger.warning(f"Error detected in logs: {line}")
-                logger.info("Triggering Auto-Heal sequence...")
-                
-                # Capture the buffer context
-                context = "\n".join(log_buffer)
-                
-                # Call LLM
-                patch = call_llm_for_fix(client, context)
-                if patch:
-                    success = apply_patch(patch)
-                    if success:
-                        deploy_fix()
-                        # Reset cooldown after successful fix cycle
-                        last_fix_time = time.time()
-                        # Clear buffer to avoid re-triggering immediately
-                        log_buffer.clear()
-                    else:
-                        logger.error("Auto-Heal patch failed to apply.")
-                else:
-                    logger.error("Auto-Heal failed to generate a patch.")
-                
-    except KeyboardInterrupt:
-        logger.info("Daemon interrupted by user. Shutting down...")
-    finally:
-        if process.poll() is None:
-            process.terminate()
-            process.wait()
+                if ERROR_REGEX.search(line):
+                    self._handle_error(line)
+        except KeyboardInterrupt:
+            logger.info(json.dumps({"event": "daemon_stopped"}))
+        finally:
+            if process.poll() is None:
+                process.terminate()
+
+    def _handle_error(self, line):
+        if time.time() - self.last_fix_time < COOLDOWN_SECONDS:
+            return
+
+        if not StateManager.acquire_lock():
+            return
+
+        try:
+            logger.warning(json.dumps({"event": "error_detected", "log": line}))
+            patch = self.worker.analyze_and_patch("\n".join(self.log_buffer))
+            
+            if patch and self._apply_patch(patch):
+                self._deploy()
+                self.last_fix_time = time.time()
+                self.log_buffer.clear()
+        finally:
+            StateManager.release_lock()
+
+    def _apply_patch(self, patch: dict) -> bool:
+        try:
+            file_path = patch.get("file_path")
+            with open(file_path, "r", encoding="utf-8") as f:
+                content = f.read()
+            if patch["old_code"] not in content:
+                return False
+            with open(file_path, "w", encoding="utf-8") as f:
+                f.write(content.replace(patch["old_code"], patch["new_code"], 1))
+            logger.info(json.dumps({"event": "patch_applied", "file": file_path}))
+            return True
+        except Exception as e:
+            logger.error(json.dumps({"event": "patch_failed", "error": str(e)}))
+            return False
+
+    def _deploy(self):
+        logger.info(json.dumps({"event": "deploy_initiated"}))
+        subprocess.run(DEFAULT_DEPLOY_CMD, capture_output=True)
+        logger.info(json.dumps({"event": "deploy_completed"}))
 
 if __name__ == "__main__":
-    run_daemon()
+    Orchestrator().run()
